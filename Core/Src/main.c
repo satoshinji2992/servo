@@ -47,8 +47,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t upper_angle = 240; // 上舵机角度 (中位)
-uint8_t lower_angle = 135; // 下舵机角度 (中位)
+uint16_t upper_angle = 240; // 上舵机角度 (中位)
+uint16_t lower_angle = 135; // 下舵机角度 (中位)
 
 // 串口交互变量
 uint8_t rx_char;
@@ -60,8 +60,8 @@ uint8_t command_ready = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void servo_set_upper_angle(uint8_t angle);
-void servo_set_lower_angle(uint8_t angle);
+void servo_set_upper_angle(uint16_t angle);
+void servo_set_lower_angle(uint16_t angle);
 void process_uart_command(void);
 void parse_servo_command(char *cmd);
 extern TIM_HandleTypeDef htim2;
@@ -71,7 +71,7 @@ extern UART_HandleTypeDef huart1;
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 // 上舵机控制函数：TIM2_CH2 (PA1) - TBS-K20 270度舵机
-void servo_set_upper_angle(uint8_t angle)
+void servo_set_upper_angle(uint16_t angle)
 {
     if (angle > 270)
         angle = 270;
@@ -80,7 +80,7 @@ void servo_set_upper_angle(uint8_t angle)
 }
 
 // 下舵机控制函数：TIM2_CH3 (PA2) - TBS-K20 270度舵机
-void servo_set_lower_angle(uint8_t angle)
+void servo_set_lower_angle(uint16_t angle)
 {
     if (angle > 270)
         angle = 270;
