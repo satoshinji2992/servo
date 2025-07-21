@@ -47,14 +47,19 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t upper_angle = 240; // 上舵机角度 (中位)
-uint16_t lower_angle = 135; // 下舵机角度 (中位)
+uint16_t upper_angle = 230; // 上舵机角度 (中位)
+uint16_t lower_angle = 107; // 下舵机角度 (中位)
 
 // 串口交互变量
-uint8_t rx_char;
-char uart_buffer[32];
-uint8_t uart_index = 0;
-uint8_t command_ready = 0;
+uint8_t rx_buffer[32];
+uint8_t rx_index = 0;
+uint8_t packet_ready = 0;
+uint8_t rx_byte; // 接收缓冲区
+
+// 协议解析相关
+#define PROTOCOL_HEADER_SIZE 4
+uint8_t protocol_header[PROTOCOL_HEADER_SIZE] = {0xAA, 0xCA, 0xAC, 0xBB};
+uint8_t header_match_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,8 +67,8 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void servo_set_upper_angle(uint16_t angle);
 void servo_set_lower_angle(uint16_t angle);
-void process_uart_command(void);
-void parse_servo_command(char *cmd);
+void process_uart_packet(void);
+void parse_protocol_packet(uint8_t *data, uint16_t len);
 extern TIM_HandleTypeDef htim2;
 extern UART_HandleTypeDef huart1;
 /* USER CODE END PFP */
@@ -88,104 +93,114 @@ void servo_set_lower_angle(uint16_t angle)
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, pulse);
 }
 
-// 串口命令处理函数
-void process_uart_command(void)
+// 串口数据包处理函数
+void process_uart_packet(void)
 {
-    if (command_ready)
+    if (packet_ready)
     {
-        uart_buffer[uart_index] = '\0'; // 字符串结束符
-        parse_servo_command(uart_buffer);
-        uart_index = 0;
-        command_ready = 0;
+        // 停止串口接收，避免干扰
+        HAL_UART_AbortReceive_IT(&huart1);
+
+        parse_protocol_packet(rx_buffer, 16);
+
+        // 重置并重新开始
+        rx_index = 0;
+        packet_ready = 0;
+        header_match_count = 0;
+
+        // 重新启动接收
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
 }
 
-// 解析舵机控制命令
-void parse_servo_command(char *cmd)
+// 简洁的协议解析函数
+void parse_protocol_packet(uint8_t *data, uint16_t len)
 {
-    char response[128];
-
-    // 检查命令长度
-    if (strlen(cmd) == 6)
+    // 检查协议头 AA CA AC BB
+    if (data[0] == 0xAA && data[1] == 0xCA &&
+        data[2] == 0xAC && data[3] == 0xBB &&
+        data[9] == 0x11) // 检查命令字节
     {
-        // 6位数字格式: 前3位上舵机，后3位下舵机
-        char upper_str[4] = {cmd[0], cmd[1], cmd[2], '\0'};
-        char lower_str[4] = {cmd[3], cmd[4], cmd[5], '\0'};
+        // 提取舵机增量 (小端序)
+        int16_t delta_y = (int16_t)(data[10] | (data[11] << 8));
+        int16_t delta_x = (int16_t)(data[12] | (data[13] << 8));
 
-        int upper = atoi(upper_str);
-        int lower = atoi(lower_str);
+        // 更新角度
+        int16_t new_upper = (int16_t)upper_angle + delta_x;
+        int16_t new_lower = (int16_t)lower_angle + delta_y;
 
-        if (upper >= 0 && upper <= 270 && lower >= 0 && lower <= 270)
-        {
-            upper_angle = upper;
-            lower_angle = lower;
-            servo_set_upper_angle(upper_angle);
-            servo_set_lower_angle(lower_angle);
+        // 限制范围
+        if (new_upper < 0)
+            new_upper = 0;
+        if (new_upper > 270)
+            new_upper = 270;
+        if (new_lower < 0)
+            new_lower = 0;
+        if (new_lower > 270)
+            new_lower = 270;
 
-            sprintf(response, "OK: Upper=%d, Lower=%d\r\n", upper_angle, lower_angle);
-        }
-        else
-        {
-            sprintf(response, "ERROR: Angles out of range (0-270)\r\n");
-        }
-    }
-    else if (strncmp(cmd, "status", 6) == 0)
-    {
-        // 状态查询命令
-        sprintf(response, "Status: Upper=%d, Lower=%d\r\n", upper_angle, lower_angle);
-    }
-    else if (strncmp(cmd, "help", 4) == 0)
-    {
-        // 帮助命令
-        sprintf(response, "Commands:\r\n"
-                          "- 6-digits: Set angles (e.g. 135090)\r\n"
-                          "- status: Show current angles\r\n"
-                          "- help: Show this help\r\n"
-                          "Range: 0-270 degrees\r\n");
-    }
-    else
-    {
-        sprintf(response, "ERROR: Invalid command. Type 'help' for usage.\r\n");
-    }
+        // 更新舵机
+        upper_angle = (uint16_t)new_upper;
+        lower_angle = (uint16_t)new_lower;
+        servo_set_upper_angle(upper_angle);
+        servo_set_lower_angle(lower_angle);
 
-    // 发送响应
-    HAL_UART_Transmit(&huart1, (uint8_t *)response, strlen(response), 1000);
+        // 只输出最终结果
+        char msg[50];
+        sprintf(msg, "OK:%d,%d\r\n", upper_angle, lower_angle);
+        HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+    }
 }
+// ...existing code...
 
 // 串口中断回调函数
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
-        // 回显字符
-        HAL_UART_Transmit(&huart1, &rx_char, 1, 10);
+        // 存储接收到的字节
+        rx_buffer[rx_index++] = rx_byte;
 
-        if (rx_char == '\r' || rx_char == '\n')
+        // 检查协议头匹配
+        if (header_match_count < PROTOCOL_HEADER_SIZE)
         {
-            // 收到回车或换行，命令结束
-            if (uart_index > 0)
+            if (rx_byte == protocol_header[header_match_count])
             {
-                command_ready = 1;
+                header_match_count++;
+            }
+            else
+            {
+                // 协议头不匹配，检查是否是新的开始
+                if (rx_byte == protocol_header[0])
+                {
+                    rx_index = 1;
+                    rx_buffer[0] = rx_byte;
+                    header_match_count = 1;
+                }
+                else
+                {
+                    rx_index = 0;
+                    header_match_count = 0;
+                }
             }
         }
-        else if (rx_char == '\b' || rx_char == 127) // 退格键
+
+        // 检查是否接收完整数据包
+        if (header_match_count >= PROTOCOL_HEADER_SIZE && rx_index >= 16)
         {
-            if (uart_index > 0)
-            {
-                uart_index--;
-                // 发送退格序列
-                char backspace[] = "\b \b";
-                HAL_UART_Transmit(&huart1, (uint8_t *)backspace, 3, 10);
-            }
+            packet_ready = 1;
+            return; // 数据包完整，等待处理
         }
-        else if (uart_index < sizeof(uart_buffer) - 1)
+
+        // 防止缓冲区溢出
+        if (rx_index >= sizeof(rx_buffer))
         {
-            // 普通字符
-            uart_buffer[uart_index++] = rx_char;
+            rx_index = 0;
+            header_match_count = 0;
         }
 
         // 重新启动接收
-        HAL_UART_Receive_IT(&huart1, &rx_char, 1);
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
 }
 /* USER CODE END 0 */
@@ -230,15 +245,16 @@ int main(void)
     servo_set_lower_angle(lower_angle);
 
     // 启动串口中断接收
-    HAL_UART_Receive_IT(&huart1, &rx_char, 1);
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
     // 发送提示信息
-    char welcome[] = "TBS-K20 Ready\r\nFormat: 6-digits (e.g. 135090)\r\nFirst 3: upper servo, Last 3: lower servo\r\nRange: 0-270\r\n";
+    char welcome[] = "Protocol Parser Ready\r\nWaiting for binary protocol packets...\r\n";
     HAL_UART_Transmit(&huart1, (uint8_t *)welcome, strlen(welcome), 1000);
 
-    // 发送调试信息
-    char debug_msg[] = "Debug: UART ready for commands\r\n";
-    HAL_UART_Transmit(&huart1, (uint8_t *)debug_msg, strlen(debug_msg), 1000);
+    // 发送当前角度
+    char status[100];
+    sprintf(status, "Initial angles: Upper=%d, Lower=%d\r\n", upper_angle, lower_angle);
+    HAL_UART_Transmit(&huart1, (uint8_t *)status, strlen(status), 1000);
     /* USER CODE END 2 */
 
     /* Infinite loop */
@@ -248,7 +264,7 @@ int main(void)
         /* USER CODE END WHILE */
 
         /* USER CODE BEGIN 3 */
-        process_uart_command(); // 处理串口命令
+        process_uart_packet(); // 处理串口数据包
     }
     /* USER CODE END 3 */
 }

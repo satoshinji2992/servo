@@ -44,42 +44,23 @@ def find_green_laser():
     # 初始化通信协议 (自动根据系统配置初始化UART或TCP)
     p = comm.CommProtocol(buff_size=1024)
     
-    # 定义命令
-    APP_CMD_LASER_COORD = 0x10
-    APP_CMD_SERVO_CONTROL = 0x11
-    
     # 画面中心和死区
     CENTER_X, CENTER_Y = 160, 120
-    DEAD_ZONE = 5
+    DEAD_ZONE = 3
     
     # PID控制器 (稳定跟踪参数)
-    pid_x = PIDController(kp=0.08, ki=0.002, kd=0.03, output_limit=10)
-    pid_y = PIDController(kp=0.08, ki=0.002, kd=0.03, output_limit=10)
+    pid_x = PIDController(kp=0.15, ki=0.0012, kd=0.008, output_limit=10)
+    pid_y = PIDController(kp=0.08, ki=0.001, kd=0.008, output_limit=10)
     
     # 时间记录
     last_time = time.ticks_ms()
     
     # 绿色激光HSV范围
-    lower_green = np.array([40, 50, 50])
+    lower_green = np.array([30, 40, 30])
     upper_green = np.array([80, 255, 255])
     kernel = np.ones((3, 3), np.uint8)
     
-    def encode_laser_coord(x, y):
-        '''编码激光点坐标为字节数据'''
-        return struct.pack("<HH", x, y)  # 2字节x + 2字节y (无符号，小端)
-    
-    def encode_servo_angles(delta_x, delta_y):
-        '''编码舵机角度增量'''
-        return struct.pack("<hh", delta_x, delta_y)  # 有符号16位
-    
     while not app.need_exit():
-        # 处理接收到的消息
-        msg = p.get_msg()
-        if msg and msg.is_req:
-            if msg.cmd == APP_CMD_LASER_COORD:
-                # 如果收到激光坐标请求，发送确认
-                p.resp_ok(msg.cmd, b'\x01')
-        
         # 计算时间间隔
         current_time = time.ticks_ms()
         dt = (current_time - last_time) / 1000.0  # 转换为秒
@@ -132,9 +113,9 @@ def find_green_laser():
                     servo_delta_x = -delta_x  # 反向
                     servo_delta_y = -delta_y  # 反向
                     
-                    # 发送舵机控制命令
-                    servo_body = encode_servo_angles(servo_delta_x, servo_delta_y)
-                    p.report(APP_CMD_SERVO_CONTROL, servo_body)
+                    # 直接发送两个改变值
+                    data = struct.pack("<hh", servo_delta_x, servo_delta_y)
+                    p.report(0x11, data)
                     
                     print(f"Laser: ({center[0]}, {center[1]}) Error: ({error_x}, {error_y}) Servo: ({servo_delta_x}, {servo_delta_y}) delta: ({delta_x}, {delta_y})")
                     
@@ -146,9 +127,6 @@ def find_green_laser():
                     cv2.putText(frame, "In Dead Zone", 
                                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                 
-                # 发送激光点坐标 (保留原功能)
-                coord_body = encode_laser_coord(center[0], center[1])
-                p.report(APP_CMD_LASER_COORD, coord_body)
         else:
             # 没有检测到激光点，重置PID
             pid_x.reset()
