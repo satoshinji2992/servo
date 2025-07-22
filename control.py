@@ -104,7 +104,7 @@ class TouchInterface:
         # 返回映射后的坐标、按下状态和是否为点击事件
         return x, y, pressed, clicked, x_raw, y_raw
 
-def find_green_laser():
+def find_laser():
     # 初始化
     disp = display.Display()
     cam = camera.Camera(320, 240, image.Format.FMT_BGR888)
@@ -117,11 +117,17 @@ def find_green_laser():
     DEAD_ZONE = 3
     
     # PID控制器 (稳定跟踪参数)
-    pid_x = PIDController(kp=0.15, ki=0.0012, kd=0.008, output_limit=10)
-    pid_y = PIDController(kp=0.08, ki=0.001, kd=0.008, output_limit=10)
+    pid_x = PIDController(kp=0.11, ki=0.001, kd=0.01, output_limit=10)
+    pid_y = PIDController(kp=0.085, ki=0.0008, kd=0.008, output_limit=10)
     
-    # 初始化HSV控制器
-    hsv_controller = HSVController([30, 40, 30], [80, 255, 255])
+    # 初始化HSV控制器 - 绿色激光
+    hsv_controller = HSVController([30, 20, 20], [80, 255, 255])
+    
+    # 红色激光HSV范围 (进一步降低要求，适应暗淡的红色激光)
+    red_lower1 = np.array([0, 30, 30])      # 进一步降低饱和度和亮度要求
+    red_upper1 = np.array([15, 255, 255])   # 扩大色调范围
+    red_lower2 = np.array([165, 30, 30])    # 进一步降低饱和度和亮度要求
+    red_upper2 = np.array([179, 255, 255])
     
     # 初始化触摸界面
     touch_ui = TouchInterface(320, 240)
@@ -230,70 +236,124 @@ def find_green_laser():
                     hsv_controller.current_mode = "select"
                     print("Exit to select mode")
         
-        # 绘制中心十字线
-        cv2.line(frame, (CENTER_X-10, CENTER_Y), (CENTER_X+10, CENTER_Y), (255, 255, 255), 1)
-        cv2.line(frame, (CENTER_X, CENTER_Y-10), (CENTER_X, CENTER_Y+10), (255, 255, 255), 1)
-        
-        # HSV转换和掩码
+        # HSV转换
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # 检测绿色激光
         lower_green, upper_green = hsv_controller.get_hsv_range()
-        mask = cv2.inRange(hsv, lower_green, upper_green)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+        mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
         
-        # 查找轮廓
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 检测红色激光 (红色在HSV中有两个范围)
+        mask_red1 = cv2.inRange(hsv, red_lower1, red_upper1)
+        mask_red2 = cv2.inRange(hsv, red_lower2, red_upper2)
+        mask_red = mask_red1 + mask_red2
         
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            (x, y), radius = cv2.minEnclosingCircle(largest_contour)
-            center = (int(x), int(y))
+        # 对红色激光使用更宽松的形态学处理
+        kernel_small = np.ones((2, 2), np.uint8)  # 更小的核，保留小点
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel_small)  # 先闭运算连接小点
+        
+        # 查找绿色激光轮廓
+        contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 查找红色激光轮廓
+        contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 记录激光点坐标
+        green_center = None
+        red_center = None
+        
+        # 处理绿色激光
+        if contours_green:
+            largest_contour_green = max(contours_green, key=cv2.contourArea)
+            (x, y), radius = cv2.minEnclosingCircle(largest_contour_green)
+            green_center = (int(x), int(y))
             
-            if 2 < radius < 50:
-                # 绘制激光点
-                cv2.circle(frame, center, int(radius), (0, 255, 0), 2)
-                cv2.circle(frame, center, 2, (0, 0, 255), -1)
-                cv2.putText(frame, f"{center}", (center[0] + 10, center[1] - 10), 
+            if 0.5 < radius < 50:
+                # 绘制绿色激光点
+                cv2.circle(frame, green_center, int(radius), (0, 255, 0), 2)
+                cv2.circle(frame, green_center, 2, (0, 0, 255), -1)
+                cv2.putText(frame, f"Green: {green_center}", (green_center[0] + 10, green_center[1] - 10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                
-                # 计算误差 (激光点相对于画面中心的偏移)
-                error_x = center[0] - CENTER_X  # 正值：激光点在右侧
-                error_y = center[1] - CENTER_Y  # 正值：激光点在下方
+        
+        # 处理红色激光
+        if contours_red:
+            largest_contour_red = max(contours_red, key=cv2.contourArea)
+            (x, y), radius = cv2.minEnclosingCircle(largest_contour_red)
+            red_center = (int(x), int(y))
+            
+            # 进一步降低要求，适应很小的激光点
+            if 0.5 < radius < 50:  # 允许更小的激光点
+                # 绘制红色激光点
+                cv2.circle(frame, red_center, int(radius), (0, 0, 255), 2)
+                cv2.circle(frame, red_center, 2, (255, 0, 0), -1)
+                cv2.putText(frame, f"Red: {red_center}", (red_center[0] + 10, red_center[1] + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        
+        # 使用绿色激光追踪红色激光（计算绿色激光相对于红色激光的误差）
+        if green_center and red_center:
+                # 计算误差 (绿色激光相对于红色激光的偏移)
+                error_x = green_center[0] - red_center[0]  # 正值：绿色激光在红色激光右侧
+                error_y = green_center[1] - red_center[1]  # 正值：绿色激光在红色激光下方
                 
                 # 显示误差信息
-                cv2.putText(frame, f"Error: ({error_x}, {error_y})", 
+                cv2.putText(frame, f"Error G->R: ({error_x}, {error_y})", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # 显示两个激光点的状态
+                status_y = 40
+                cv2.putText(frame, f"Green Target: {green_center}", 
+                           (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                status_y += 15
+                cv2.putText(frame, f"Red Servo (Following): {red_center}", 
+                           (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                status_y += 15
                 
                 # 检查是否在死区内
                 if abs(error_x) > DEAD_ZONE or abs(error_y) > DEAD_ZONE:
-                    # PID计算角度增量
-                    delta_x = pid_x.update(error_x, dt)  # X轴：正值向右转(减小angle)
-                    delta_y = pid_y.update(error_y, dt)  # Y轴：正值向下转(减小angle)
+                    # PID计算角度增量 - 让红色激光追向绿色激光
+                    delta_x = pid_x.update(error_x, dt)  
+                    delta_y = pid_y.update(error_y, dt)  
                     
-                    # 根据舵机方向调整：
-                    # 激光点在右侧(error_x>0) -> 舵机向右转 -> angle减小 -> delta_x为负
-                    # 激光点在下方(error_y>0) -> 舵机向下转 -> angle减小 -> delta_y为负
-                    servo_delta_x = -delta_x  # 反向
-                    servo_delta_y = -delta_y  # 反向
+                    # 舵机控制方向：
+                    # 绿色在红色右侧(error_x>0) -> 舵机向右转 -> delta_x为正
+                    # 绿色在红色下方(error_y>0) -> 舵机向下转 -> delta_y为正
+                    servo_delta_x = -delta_x
+                    servo_delta_y = -delta_y
                     
-                    # 直接发送两个改变值
+                    # 发送舵机控制命令到STM32
                     data = struct.pack("<hh", servo_delta_x, servo_delta_y)
                     p.report(0x11, data)
                     
-                    print(f"Laser: ({center[0]}, {center[1]}) Error: ({error_x}, {error_y}) Servo: ({servo_delta_x}, {servo_delta_y}) delta: ({delta_x}, {delta_y})")
+                    print(f"Green: {green_center} Red: {red_center} Error: ({error_x}, {error_y}) Servo: ({servo_delta_x}, {servo_delta_y})")
                     
                     # 显示控制输出
                     cv2.putText(frame, f"Servo: ({servo_delta_x}, {servo_delta_y})", 
-                               (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                               (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                 else:
                     # 在死区内，不需要调整
-                    cv2.putText(frame, "In Dead Zone", 
-                               (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                    cv2.putText(frame, "Red laser aligned with Green", 
+                               (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                
+        elif green_center and not red_center:
+            # 只检测到绿色激光，没有红色激光
+            cv2.putText(frame, "Green detected, waiting for Red laser", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            cv2.putText(frame, f"Green Target: {green_center}", 
+                       (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            
+        elif red_center and not green_center:
+            # 只检测到红色激光，没有绿色激光
+            cv2.putText(frame, "Red detected, waiting for Green target", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            cv2.putText(frame, f"Red Servo: {red_center}", 
+                       (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
                 
         else:
-            # 没有检测到激光点，重置PID
+            # 没有检测到任何激光，重置PID
             pid_x.reset()
             pid_y.reset()
-            cv2.putText(frame, "No Laser Detected", 
+            cv2.putText(frame, "No laser detected", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         
         # 显示图像
@@ -302,4 +362,4 @@ def find_green_laser():
         time.sleep_ms(50)
 
 if __name__ == "__main__":
-    find_green_laser()
+    find_laser()
