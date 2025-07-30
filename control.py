@@ -30,7 +30,7 @@ class PIDController:
         output = max(-self.output_limit, min(self.output_limit, output))
         
         self.prev_error = error
-        return int(output)
+        return float(output)
     
     def reset(self):
         self.prev_error = 0
@@ -321,8 +321,8 @@ def find_laser():
                     servo_delta_x = -delta_x
                     servo_delta_y = -delta_y
                     
-                    # 发送舵机控制命令到STM32
-                    data = struct.pack("<hh", servo_delta_x, servo_delta_y)
+                    # 发送double精度舵机控制命令到STM32
+                    data = struct.pack("<dd", float(servo_delta_x), float(servo_delta_y))
                     p.report(0x11, data)
                     
                     print(f"Green: {green_center} Red: {red_center} Error: ({error_x}, {error_y}) Servo: ({servo_delta_x}, {servo_delta_y})")

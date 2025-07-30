@@ -41,14 +41,15 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+int pulse_delay_us = 400;
 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t upper_angle = 230; // 上舵机角度 (中位)
-uint16_t lower_angle = 107; // 下舵机角度 (中位)
+double upper_angle = 190.0; // 上舵机角度 (中位)
+double lower_angle = 0.0;   // 当前角度，初始化为0.0
 
 // 串口交互变量
 uint8_t rx_buffer[32];
@@ -65,8 +66,11 @@ uint8_t header_match_count = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void servo_set_upper_angle(uint16_t angle);
-void servo_set_lower_angle(uint16_t angle);
+void servo_set_upper_angle(double angle);
+void servo_set_lower_angle(double angle);
+void stepper1_set_dir(uint8_t dir);
+void stepper1_step_once(void);
+
 void process_uart_packet(void);
 void parse_protocol_packet(uint8_t *data, uint16_t len);
 extern TIM_HandleTypeDef htim2;
@@ -76,21 +80,37 @@ extern UART_HandleTypeDef huart1;
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 // 上舵机控制函数：TIM2_CH2 (PA1) - TBS-K20 270度舵机
-void servo_set_upper_angle(uint16_t angle)
+void servo_set_upper_angle(double angle)
 {
     if (angle > 270)
         angle = 270;
-    uint16_t pulse = 50 + (angle * 200) / 270; // 500μs-2500μs对应50-250
+    if (angle < 0)
+        angle = 0;
+    int pulse = 50 + (angle * 200) / 270; // 500μs-2500μs对应50-250
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
 }
 
-// 下舵机控制函数：TIM2_CH3 (PA2) - TBS-K20 270度舵机
-void servo_set_lower_angle(uint16_t angle)
+// 下舵机控制函数：步进电机控制
+void servo_set_lower_angle(double angle)
 {
-    if (angle > 270)
-        angle = 270;
-    uint16_t pulse = 50 + (angle * 200) / 270; // 500μs-2500μs对应50-250
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, pulse);
+    double delta = angle - lower_angle;
+    if (delta == 0)
+        return; // 如果角度没有变化，直接返回
+    if (delta < 0)
+    {
+        stepper1_set_dir(0); // 反向
+    }
+    else
+    {
+        stepper1_set_dir(1); // 正向
+    }
+    int steps = (int)(abs(delta) / 0.1125); // 每步0.1125度
+    for (int i = 0; i < steps; i++)
+    {
+
+        stepper1_step_once();
+        lower_angle += (delta < 0) ? -0.1125 : 0.1125; // 更新当前角度
+    }
 }
 
 // 串口数据包处理函数
@@ -101,7 +121,7 @@ void process_uart_packet(void)
         // 停止串口接收，避免干扰
         HAL_UART_AbortReceive_IT(&huart1);
 
-        parse_protocol_packet(rx_buffer, 16);
+        parse_protocol_packet(rx_buffer, 28);
 
         // 重置并重新开始
         rx_index = 0;
@@ -121,37 +141,44 @@ void parse_protocol_packet(uint8_t *data, uint16_t len)
         data[2] == 0xAC && data[3] == 0xBB &&
         data[9] == 0x11) // 检查命令字节
     {
-        // 提取舵机增量 (小端序)
-        int16_t delta_y = (int16_t)(data[10] | (data[11] << 8));
-        int16_t delta_x = (int16_t)(data[12] | (data[13] << 8));
+        // 提取舵机增量 (double, 小端序)
+        double delta_y = 0, delta_x = 0;
+        memcpy(&delta_y, &data[10], sizeof(double));
+        memcpy(&delta_x, &data[18], sizeof(double));
+
+        // 保留两位小数
+        delta_y = (int)(delta_y * 100) / 100.0;
+        delta_x = (int)(delta_x * 100) / 100.0;
+
+        // 回显收到的增量数据
+        char echo[80];
+        sprintf(echo, "ECHO: delta_x=%d, delta_y=%d\r\n", (int)(delta_x * 100), (int)(delta_y * 100));
+        HAL_UART_Transmit(&huart1, (uint8_t *)echo, strlen(echo), 100);
 
         // 更新角度
-        int16_t new_upper = (int16_t)upper_angle + delta_x;
-        int16_t new_lower = (int16_t)lower_angle + delta_y;
+        double new_upper = upper_angle + delta_x;
+        double new_lower = lower_angle + delta_y;
 
         // 限制范围
         if (new_upper < 0)
             new_upper = 0;
         if (new_upper > 270)
             new_upper = 270;
-        if (new_lower < 0)
-            new_lower = 0;
-        if (new_lower > 270)
-            new_lower = 270;
 
         // 更新舵机
-        upper_angle = (uint16_t)new_upper;
-        lower_angle = (uint16_t)new_lower;
+        upper_angle = new_upper;
         servo_set_upper_angle(upper_angle);
-        servo_set_lower_angle(lower_angle);
+        servo_set_lower_angle(new_lower);
 
         // 只输出最终结果
-        char msg[50];
-        sprintf(msg, "OK:%d,%d\r\n", upper_angle, lower_angle);
-        HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+        // char msg[50];
+        // sprintf(msg, "OK:%.1f,%.1f\r\n", upper_angle, lower_angle);
+        // HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+
+        // 翻转PC13
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
     }
 }
-// ...existing code...
 
 // 串口中断回调函数
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -186,7 +213,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
 
         // 检查是否接收完整数据包
-        if (header_match_count >= PROTOCOL_HEADER_SIZE && rx_index >= 16)
+        if (header_match_count >= PROTOCOL_HEADER_SIZE && rx_index >= 28)
         {
             packet_ready = 1;
             return; // 数据包完整，等待处理
@@ -202,6 +229,28 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         // 重新启动接收
         HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
+}
+
+// 步进电机1控制相关
+void stepper1_enable(uint8_t enable)
+{
+    HAL_GPIO_WritePin(GPIOA, En1_Pin, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+void stepper1_set_dir(uint8_t dir)
+{
+    HAL_GPIO_WritePin(GPIOA, Dir1_Pin, dir ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+void stepper1_step_once(void)
+{
+    // 产生一个脉冲
+    HAL_GPIO_WritePin(GPIOA, Stp1_Pin, GPIO_PIN_SET);
+    for (volatile int d = 0; d < pulse_delay_us * 10; d++)
+        ;
+    HAL_GPIO_WritePin(GPIOA, Stp1_Pin, GPIO_PIN_RESET);
+    for (volatile int d = 0; d < pulse_delay_us * 10; d++)
+        ;
 }
 /* USER CODE END 0 */
 
@@ -237,12 +286,14 @@ int main(void)
     MX_TIM2_Init();
     MX_USART1_UART_Init();
     /* USER CODE BEGIN 2 */
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // 启动触发器PWM (PA0)
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // 启动上舵机PWM
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3); // 启动下舵机PWM
 
     // 初始化舵机位置
     servo_set_upper_angle(upper_angle);
-    servo_set_lower_angle(lower_angle);
+    servo_set_lower_angle(20.0);
+    servo_set_lower_angle(0.0);
 
     // 启动串口中断接收
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
@@ -253,8 +304,11 @@ int main(void)
 
     // 发送当前角度
     char status[100];
-    sprintf(status, "Initial angles: Upper=%d, Lower=%d\r\n", upper_angle, lower_angle);
+    sprintf(status, "Initial angles: Upper=%.1f, Lower=%.1f\r\n", upper_angle, lower_angle); // 修正格式化字符串
     HAL_UART_Transmit(&huart1, (uint8_t *)status, strlen(status), 1000);
+    // 步进电机初始化
+    stepper1_enable(1); // 使能（保持高电平）
+    // 不再关闭使能，EN1 始终为高电平
     /* USER CODE END 2 */
 
     /* Infinite loop */
@@ -265,6 +319,7 @@ int main(void)
 
         /* USER CODE BEGIN 3 */
         process_uart_packet(); // 处理串口数据包
+        // 可在此处添加步进电机控制逻辑
     }
     /* USER CODE END 3 */
 }
