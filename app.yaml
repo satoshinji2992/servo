@@ -1,0 +1,8 @@
+id: question_e
+name: 打靶小车
+version: 1.0.0
+author: satoshinji
+icon: app.png
+desc: 激光打靶小车
+files:
+  - 打靶小车.py

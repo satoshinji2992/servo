@@ -41,15 +41,17 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-int pulse_delay_us = 400;
+int pulse_delay_us = 700;
 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-double upper_angle = 190.0; // 上舵机角度 (中位)
+double upper_angle = 200.0; // 上舵机角度 (中位)
 double lower_angle = 0.0;   // 当前角度，初始化为0.0
+double last_yaw = 0.0;      // 上次yaw角度，用于计算增量
+int count = 0;              // 用于计数，控制步进旋转
 
 // 串口交互变量
 uint8_t rx_buffer[32];
@@ -61,6 +63,13 @@ uint8_t rx_byte; // 接收缓冲区
 #define PROTOCOL_HEADER_SIZE 4
 uint8_t protocol_header[PROTOCOL_HEADER_SIZE] = {0xAA, 0xCA, 0xAC, 0xBB};
 uint8_t header_match_count = 0;
+
+// JY61P 解析相关
+static uint8_t RxBuffer_JY61[11];
+static volatile uint8_t RxState_JY61 = 0;
+static uint8_t RxIndex_JY61 = 0;
+float g_roll_jy61 = 0, g_pitch_jy61 = 0, g_yaw_jy61 = 0;
+uint8_t rx_byte_jy61;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,6 +84,7 @@ void process_uart_packet(void);
 void parse_protocol_packet(uint8_t *data, uint16_t len);
 extern TIM_HandleTypeDef htim2;
 extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart2;
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -93,9 +103,18 @@ void servo_set_upper_angle(double angle)
 // 下舵机控制函数：步进电机控制
 void servo_set_lower_angle(double angle)
 {
-    double delta = angle - lower_angle;
-    if (delta == 0)
-        return; // 如果角度没有变化，直接返回
+    double delta = angle - lower_angle; // 计算实际需要转动的角度
+    double abs_delta = fabs(delta);     // 取绝对值
+    if (abs_delta < 0.1125)
+        return; // 如果角度变化小于0.1125度，直接返回
+    if (abs_delta > 10.0)
+    {
+        pulse_delay_us = 600;
+    }
+    else
+    {
+        pulse_delay_us = 1000; // 正常转动速度
+    }
     if (delta < 0)
     {
         stepper1_set_dir(0); // 反向
@@ -104,7 +123,7 @@ void servo_set_lower_angle(double angle)
     {
         stepper1_set_dir(1); // 正向
     }
-    int steps = (int)(abs(delta) / 0.1125); // 每步0.1125度
+    int steps = (int)(abs_delta / 0.1125); // 每步0.1125度
     for (int i = 0; i < steps; i++)
     {
 
@@ -150,10 +169,17 @@ void parse_protocol_packet(uint8_t *data, uint16_t len)
         delta_y = (int)(delta_y * 100) / 100.0;
         delta_x = (int)(delta_x * 100) / 100.0;
 
+        // 判断是否瞄准完成（收到500,500）
+        if (delta_x == 500.0 && delta_y == 500.0)
+        {
+            HAL_GPIO_WritePin(GPIOA, Laser_Pin, GPIO_PIN_RESET); // 激光关闭
+            return;
+        }
+
         // 回显收到的增量数据
-        char echo[80];
-        sprintf(echo, "ECHO: delta_x=%d, delta_y=%d\r\n", (int)(delta_x * 100), (int)(delta_y * 100));
-        HAL_UART_Transmit(&huart1, (uint8_t *)echo, strlen(echo), 100);
+        // char echo[80];
+        // sprintf(echo, "ECHO: delta_x=%d, delta_y=%d, yaw=%d\r\n", (int)(delta_x * 100), (int)(delta_y * 100), (int)(g_yaw_jy61 * 100));
+        // HAL_UART_Transmit(&huart1, (uint8_t *)echo, strlen(echo), 100);
 
         // 更新角度
         double new_upper = upper_angle + delta_x;
@@ -177,6 +203,49 @@ void parse_protocol_packet(uint8_t *data, uint16_t len)
 
         // 翻转PC13
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    }
+}
+
+// JY61P 数据接收处理函数（无需头文件，直接放 main.c）
+void jy61p_ReceiveData(uint8_t RxData)
+{
+    uint8_t i, sum = 0;
+    if (RxState_JY61 == 0)
+    {
+        if (RxData == 0x55)
+        {
+            RxBuffer_JY61[RxIndex_JY61] = RxData;
+            RxState_JY61 = 1;
+            RxIndex_JY61 = 1;
+        }
+    }
+    else if (RxState_JY61 == 1)
+    {
+        if (RxData == 0x53)
+        {
+            RxBuffer_JY61[RxIndex_JY61] = RxData;
+            RxState_JY61 = 2;
+            RxIndex_JY61 = 2;
+        }
+    }
+    else if (RxState_JY61 == 2)
+    {
+        RxBuffer_JY61[RxIndex_JY61++] = RxData;
+        if (RxIndex_JY61 == 11)
+        {
+            for (i = 0; i < 10; i++)
+            {
+                sum = sum + RxBuffer_JY61[i];
+            }
+            if (sum == RxBuffer_JY61[10])
+            {
+                g_roll_jy61 = ((uint16_t)((uint16_t)RxBuffer_JY61[3] << 8 | (uint16_t)RxBuffer_JY61[2])) / 32768.0f * 180.0f;
+                g_pitch_jy61 = ((uint16_t)((uint16_t)RxBuffer_JY61[5] << 8 | (uint16_t)RxBuffer_JY61[4])) / 32768.0f * 180.0f;
+                g_yaw_jy61 = ((uint16_t)((uint16_t)RxBuffer_JY61[7] << 8 | (uint16_t)RxBuffer_JY61[6])) / 32768.0f * 180.0f;
+            }
+            RxState_JY61 = 0;
+            RxIndex_JY61 = 0;
+        }
     }
 }
 
@@ -229,6 +298,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         // 重新启动接收
         HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
+    else if (huart->Instance == USART2)
+    {
+        jy61p_ReceiveData(rx_byte_jy61);
+        HAL_UART_Receive_IT(&huart2, &rx_byte_jy61, 1);
+    }
 }
 
 // 步进电机1控制相关
@@ -244,7 +318,6 @@ void stepper1_set_dir(uint8_t dir)
 
 void stepper1_step_once(void)
 {
-    // 产生一个脉冲
     HAL_GPIO_WritePin(GPIOA, Stp1_Pin, GPIO_PIN_SET);
     for (volatile int d = 0; d < pulse_delay_us * 10; d++)
         ;
@@ -285,6 +358,7 @@ int main(void)
     MX_GPIO_Init();
     MX_TIM2_Init();
     MX_USART1_UART_Init();
+    MX_USART2_UART_Init();
     /* USER CODE BEGIN 2 */
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // 启动触发器PWM (PA0)
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // 启动上舵机PWM
@@ -292,11 +366,10 @@ int main(void)
 
     // 初始化舵机位置
     servo_set_upper_angle(upper_angle);
-    servo_set_lower_angle(20.0);
-    servo_set_lower_angle(0.0);
 
     // 启动串口中断接收
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+    HAL_UART_Receive_IT(&huart2, &rx_byte_jy61, 1);
 
     // 发送提示信息
     char welcome[] = "Protocol Parser Ready\r\nWaiting for binary protocol packets...\r\n";
@@ -315,11 +388,23 @@ int main(void)
     /* USER CODE BEGIN WHILE */
     while (1)
     {
-        /* USER CODE END WHILE */
-
+        count++;
+        if (count == 100000)
+        {
+            double now_yaw = g_yaw_jy61; // 获取当前yaw角度
+            // 计算增量(最小变化,如1到360是-2,359到4是5)
+            double delta_yaw = now_yaw - last_yaw; // 计算当前yaw与上次的差值
+            if (delta_yaw < -180)
+                delta_yaw += 360; // 如果差值小于-180，调整为正向增量
+            else if (delta_yaw > 180)
+                delta_yaw -= 360;                           // 如果差值大于180，调整为负向增量
+            last_yaw = now_yaw;                             // 更新上次yaw角度
+            servo_set_lower_angle(lower_angle - delta_yaw); // 更新下舵机角度
+            count = 0;                                      // 重置计数器
+        }
         /* USER CODE BEGIN 3 */
         process_uart_packet(); // 处理串口数据包
-        // 可在此处添加步进电机控制逻辑
+                               // 可在此处添加步进电机控制逻辑
     }
     /* USER CODE END 3 */
 }
