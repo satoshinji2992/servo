@@ -1,10 +1,12 @@
 import struct
-from maix import image, display, app, time, camera
-from maix import comm, touchscreen
 import cv2
 import numpy as np
-
-Mode = {"aim", "track"}
+import serial
+import time
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
+import threading
 
 class PIDController:
     def __init__(self, kp, ki, kd, output_limit):
@@ -22,8 +24,6 @@ class PIDController:
         output = self.kp * error + self.ki * self.integral + self.kd * derivative
         output = max(-self.output_limit, min(self.output_limit, output))
         self.prev_error = error
-        if error > 15:
-            output = 8.0
         return float(output)
     
     def reset(self):
@@ -51,7 +51,7 @@ class FrameDetector:
         """Detect rectangular frames and return their perspective-transformed centers"""
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
         gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+        mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         frames = []
@@ -69,173 +69,203 @@ class FrameDetector:
         
         return frames
 
-class TouchInterface:
-    def __init__(self, disp_width, disp_height):
-        self.ts = touchscreen.TouchScreen()
-        self.disp_width = disp_width
-        self.disp_height = disp_height
-        self.pressed_already = False
-        self.last_x = 0
-        self.last_y = 0
-        self.last_pressed = False
-    def create_button(self, x, y, width, height, text, color=(255, 255, 255)):
-        return {
-            'x': x, 'y': y, 'width': width, 'height': height,
-            'text': text, 'color': color
-        }
-    def draw_button(self, frame, button, is_selected=False):
-        color = (0, 255, 0) if is_selected else button['color']
-        cv2.rectangle(frame, 
-                     (button['x'], button['y']), 
-                     (button['x'] + button['width'], button['y'] + button['height']), 
-                     color, 2)
-        text_size = cv2.getTextSize(button['text'], cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
-        text_x = button['x'] + (button['width'] - text_size[0]) // 2
-        text_y = button['y'] + (button['height'] + text_size[1]) // 2
-        cv2.putText(frame, button['text'], (text_x, text_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    def is_button_pressed(self, x, y, button):
-        return (button['x'] <= x <= button['x'] + button['width'] and 
-                button['y'] <= y <= button['y'] + button['height'])
-    def check_touch(self, disp):
-        x_raw, y_raw, pressed = self.ts.read()
-        clicked = False
-        # 检测到触摸释放时认为是点击
-        if pressed:
-            self.pressed_already = True
-        else:
-            if self.pressed_already:
-                clicked = True
-                self.pressed_already = False
-        # 坐标映射：将触摸屏坐标映射到显示图像坐标
-        x_disp, y_disp = image.resize_map_pos(
-            disp.width(), disp.height(),  # 显示屏尺寸
-            self.disp_width, self.disp_height,  # 图像尺寸
-            image.Fit.FIT_CONTAIN,              # 适配模式
-            x_raw, y_raw                        # 原始触摸坐标
-        )
-        # 返回映射后的显示坐标、按下状态和是否为点击事件，以及原始触摸坐标
-        return x_disp, y_disp, pressed, clicked, x_raw, y_raw
+class App:
+    def __init__(self, window, window_title):
+        self.window = window
+        self.window.title(window_title)
 
-def find_laser():
-    disp = display.Display()
-    cam = camera.Camera(400, 300, image.Format.FMT_BGR888)
-    p = comm.CommProtocol(buff_size=1024)
-    
-    mode = "aim"  # "aim"=瞄准模式, "track"=追踪模式
-    # 两套PID参数
-    pid_x_aim = PIDController(kp=0.11, ki=0.001, kd=0.01, output_limit=10)
-    pid_y_aim = PIDController(kp=0.085, ki=0.0008, kd=0.008, output_limit=10)
-    pid_x_track = PIDController(kp=0.23, ki=0.018, kd=0.012, output_limit=4.0)
-    pid_y_track = PIDController(kp=0.1, ki=0.0015, kd=0.0035, output_limit=4.0)
-    pid_x = None
-    pid_y = None
-    aimed = False  # 是否已追中
-    # 只处理中心70%区域
-    crop_w, crop_h = int(400 * 0.7), int(300 * 0.7)
-    crop_x, crop_y = (400 - crop_w) // 2, (300 - crop_h) // 2
-    crop_center = (crop_w // 2, crop_h // 2)
-    
-    frame_detector = FrameDetector(min_area=1000, max_area=400*300*0.8)
-    
-    center_delta = 18
-    screen_center = (200, 150-center_delta)  #  image center
-    DEAD_ZONE = 2
-    
-    # 初始化触摸界面
-    touch_ui = TouchInterface(320, 240)
-    # 模式切换按钮
-    mode_btn = touch_ui.create_button(250, 200, 60, 30, "Mode")
-    mode = "aim"  # 初始为瞄准模式
-    
-    last_time = time.ticks_ms()
-    while not app.need_exit():
-        current_time = time.ticks_ms()
-        dt = (current_time - last_time) / 1000.0
-        last_time = current_time
-        fps = 1.0 / dt if dt > 0 else 0
+        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            raise ValueError("Unable to open video source")
         
-        img = cam.read()
-        frame = image.image2cv(img, ensure_bgr=False, copy=False)
-        # 裁剪中心70%区域
-        frame_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-        # 只在裁剪区域检测
-        frames = frame_detector.detect_frames(frame_crop)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        self.canvas = tk.Canvas(window, width=self.width, height=self.height)
+        self.canvas.pack()
+
+        # Create a frame for buttons
+        button_frame = tk.Frame(window)
+        button_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
+
+        self.btn_mode = ttk.Button(button_frame, text="Switch Mode", command=self.switch_mode)
+        self.btn_mode.pack(side=tk.LEFT, expand=True)
+
+        self.btn_start_stop = ttk.Button(button_frame, text="Start", command=self.toggle_start_stop)
+        self.btn_start_stop.pack(side=tk.LEFT, expand=True)
+
+        try:
+            self.ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+        except serial.SerialException as e:
+            print(f"Serial connection error: {e}")
+            self.ser = None
+
+        self.running = False  # Control flag
+        self.mode = "aim"  # "aim" or "track"
+        # 基于Maix版本参数，并根据树莓派帧率翻倍(dt减半)进行调整
+        # Kp_pi ≈ Kp_maix, Ki_pi ≈ 2*Ki_maix, Kd_pi ≈ 0.5*Kd_maix
+        self.pid_x_aim = PIDController(kp=0.037, ki=0.00033, kd=0.0033, output_limit=10)
+        self.pid_y_aim = PIDController(kp=0.030, ki=0.00027, kd=0.0027, output_limit=10)
+        self.pid_x_track = PIDController(kp=0.07, ki=0.012, kd=0.002, output_limit=4.0)
+        self.pid_y_track = PIDController(kp=0.033, ki=0.001, kd=0.00057, output_limit=4.0)
+        self.pid_x = self.pid_x_aim
+        self.pid_y = self.pid_y_aim
+        self.aimed = False
+
+        # self.crop_w, self.crop_h = int(self.width * 0.7), int(self.height * 0.7)
+        # self.crop_x, self.crop_y = (self.width - self.crop_w) // 2, (self.height - self.crop_h) // 2
+        
+        self.frame_detector = FrameDetector(min_area=1000, max_area=self.width * self.height * 0.8)
+        
+        self.center_delta = 25
+        self.screen_center = (self.width // 2, self.height // 2 - self.center_delta)
+        self.DEAD_ZONE = 2
+
+        self.last_time = time.time()
+        
+        self.update()
+
+        self.window.mainloop()
+
+    def toggle_start_stop(self):
+        self.running = not self.running
+        if self.running:
+            self.btn_start_stop.config(text="Stop")
+            print("Control loop started.")
+        else:
+            self.btn_start_stop.config(text="Start")
+            print("Control loop stopped.")
+            # Reset PIDs and send stop command
+            if self.pid_x: self.pid_x.reset()
+            if self.pid_y: self.pid_y.reset()
+            if self.ser:
+                payload = struct.pack("<dd", 0.0, 0.0)
+                header = b'\xAA\xBB'
+                length = len(payload).to_bytes(1, 'little')
+                checksum = (sum(payload) & 0xFF).to_bytes(1, 'little')
+                data_packet = header + length + payload + checksum
+                self.ser.write(data_packet)
+
+    def switch_mode(self):
+        self.mode = "track" if self.mode == "aim" else "aim"
+        print(f"Mode switched to {self.mode}")
+
+    def update(self):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        fps = 1.0 / dt if dt > 0 else 0
+
+        ret, frame = self.cap.read()
+        if not ret:
+            self.window.after(10, self.update)
+            return
+
+        # frame_crop = frame[self.crop_y:self.crop_y + self.crop_h, self.crop_x:self.crop_x + self.crop_w]
+        
+        frames = self.frame_detector.detect_frames(frame)
         rect_center = None
+
         if len(frames) >= 1:
             frame_pts = max(frames, key=lambda pts: cv2.contourArea(pts.astype(int)))
             dst_pts = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype="float32")
             M = cv2.getPerspectiveTransform(frame_pts, dst_pts)
             center_dst = np.array([[[50, 50]]], dtype="float32")
             center_src = cv2.perspectiveTransform(center_dst, cv2.invert(M)[1])
-            # 坐标回到原图
             rect_center = tuple(center_src[0][0].astype(int))
-            rect_center = (rect_center[0] + crop_x, rect_center[1] + crop_y)
-            frame_pts_full = frame_pts + np.array([crop_x, crop_y])
-            cv2.drawContours(frame, [frame_pts_full.astype(int)], -1, (0, 255, 0), 2)
+            # rect_center = (rect_center[0] + self.crop_x, rect_center[1] + self.crop_y)
+            # frame_pts_full = frame_pts + np.array([self.crop_x, self.crop_y])
+            cv2.drawContours(frame, [frame_pts.astype(int)], -1, (0, 255, 0), 2)
             cv2.circle(frame, rect_center, 8, (255, 0, 0), 2)
-        # PID控制
-        # 根据模式选择PID
-        if mode == "aim":
-            if pid_x is not pid_x_aim:
-                pid_x = pid_x_aim
-                pid_x.reset()
-            if pid_y is not pid_y_aim:
-                pid_y = pid_y_aim
-                pid_y.reset()
-        else:
-            if pid_x is not pid_x_track:
-                pid_x = pid_x_track
-                pid_x.reset()
-            if pid_y is not pid_y_track:
-                pid_y = pid_y_track
-                pid_y.reset()
-        if rect_center:
-            error_x = screen_center[0] - rect_center[0]
-            error_y = screen_center[1] - rect_center[1]
-            output_x = pid_x.update(error_x, dt)
-            output_y = pid_y.update(error_y, dt)
-            if mode == "aim":
-                if abs(error_x) > DEAD_ZONE or abs(error_y) > DEAD_ZONE:
-                    data = struct.pack("<dd", float(output_x), float(output_y))
-                    p.report(0x11, data)
-                    aimed = False  # 只要偏离就重置
-                else:
-                    if not aimed:
-                        data = struct.pack("<dd", 500.0, 500.0)
-                        p.report(0x11, data)
-                        aimed = True  # 只发一次
-            else:  # track模式
-                data = struct.pack("<dd", float(output_x), float(output_y))
-                p.report(0x11, data)
-            cv2.putText(frame, f"Real Center: {rect_center}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            cv2.putText(frame, f"Error: ({error_x}, {error_y})", (10, 15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        else:
-            if pid_x: pid_x.reset()
-            if pid_y: pid_y.reset()
-            aimed = False  # 丢失目标也重置
-            # 未识别到矩形时输出 dx=20, dy=0
-            data = struct.pack("<dd", -10.0, 0.0)
-            p.report(0x11, data)
-            cv2.putText(frame, "No frame detected", (10, 15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-        # 画出中心区域边框
-        cv2.rectangle(frame, (crop_x, crop_y), (crop_x+crop_w, crop_y+crop_h), (0, 255, 255), 2)
-        cv2.drawMarker(frame, screen_center, (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 65), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        # 绘制模式切换按钮
-        touch_ui.draw_button(frame, mode_btn)
-        cv2.putText(frame, f"Current Mode: {mode.upper()}", (250, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
-        # 检测模式切换按钮点击
-        x_touch, y_touch, pressed, clicked, x_raw, y_raw = touch_ui.check_touch(disp)
-        if clicked and touch_ui.is_button_pressed(x_touch, y_touch, mode_btn):
-            mode = "track" if mode == "aim" else "aim"
-            print(f"Mode switched to {mode}")
-        img_show = image.cv2image(frame, bgr=True, copy=False)
-        disp.show(img_show, fit=image.Fit.FIT_CONTAIN)
+
+            left_len = np.linalg.norm(frame_pts[0] - frame_pts[3])
+            right_len = np.linalg.norm(frame_pts[1] - frame_pts[2])
+            avg_len = (left_len + right_len) / 2
+            print(f"左右边平均长度: {avg_len:.2f}")
+            
+            # 使用新的数据点 (96, -8) 和 (72, -4)
+            k = (-4 - (-8)) / (72 - 96) 
+            b = -8 - k * 96
+            center_delta = int(k * avg_len + b)
+            self.screen_center = (self.width // 2, self.height // 2 - center_delta)
+
+        if self.running:
+            if self.mode == "aim":
+                if self.pid_x is not self.pid_x_aim:
+                    self.pid_x = self.pid_x_aim
+                    self.pid_x.reset()
+                if self.pid_y is not self.pid_y_aim:
+                    self.pid_y = self.pid_y_aim
+                    self.pid_y.reset()
+            else: # track
+                if self.pid_x is not self.pid_x_track:
+                    self.pid_x = self.pid_x_track
+                    self.pid_x.reset()
+                if self.pid_y is not self.pid_y_track:
+                    self.pid_y = self.pid_y_track
+                    self.pid_y.reset()
+
+            if rect_center:
+                error_x = self.screen_center[0] - rect_center[0]
+                error_y = self.screen_center[1] - rect_center[1]
+                output_x = self.pid_x.update(error_x, dt)
+                output_y = self.pid_y.update(error_y, dt)
+
+                if self.ser:
+                    # 根据模式选择发送的数据
+                    if self.mode == "aim" and not (abs(error_x) > self.DEAD_ZONE or abs(error_y) > self.DEAD_ZONE):
+                        # 瞄准完成
+                        if not self.aimed:
+                            payload = struct.pack("<dd", 500.0, 500.0)
+                            self.aimed = True
+                            # self.mode = "track"
+                        else:
+                            # 已经发送过瞄准完成信号，不再发送
+                            payload = None
+                    else:
+                        # 正常追踪或移动
+                        payload = struct.pack("<dd", float(output_x), float(output_y))
+                        self.aimed = False
+
+                    if payload:
+                        # 构建带校验和的完整数据包
+                        header = b'\xAA\xBB'
+                        length = len(payload).to_bytes(1, 'little')
+                        checksum = (sum(payload) & 0xFF).to_bytes(1, 'little')
+                        data_packet = header + length + payload + checksum
+                        self.ser.write(data_packet)
+                        print(f"Output: ({output_x:.2f}, {output_y:.2f})")
+
+                cv2.putText(frame, f"Real Center: {rect_center}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(frame, f"Error: ({error_x}, {error_y})", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            else:
+                if self.pid_x: self.pid_x.reset()
+                if self.pid_y: self.pid_y.reset()
+                self.aimed = False
+                if self.ser:
+                    # 丢失目标
+                    payload = struct.pack("<dd", -10.0, 0.0)
+                    header = b'\xAA\xBB'
+                    length = len(payload).to_bytes(1, 'little')
+                    checksum = (sum(payload) & 0xFF).to_bytes(1, 'little')
+                    data_packet = header + length + payload + checksum
+                    self.ser.write(data_packet)
+                cv2.putText(frame, "No frame detected", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+        # cv2.rectangle(frame, (self.crop_x, self.crop_y), (self.crop_x + self.crop_w, self.crop_y + self.crop_h), (0, 255, 255), 2)
+        cv2.drawMarker(frame, self.screen_center, (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, f"Current Mode: {self.mode.upper()}", (self.width - 150, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        self.photo = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
+
+        self.window.after(10, self.update)
+
 
 if __name__ == "__main__":
-    find_laser()
+    App(tk.Tk(), "Tkinter OpenCV App")

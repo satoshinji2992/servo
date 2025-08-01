@@ -59,10 +59,19 @@ uint8_t rx_index = 0;
 uint8_t packet_ready = 0;
 uint8_t rx_byte; // 接收缓冲区
 
-// 协议解析相关
-#define PROTOCOL_HEADER_SIZE 4
-uint8_t protocol_header[PROTOCOL_HEADER_SIZE] = {0xAA, 0xCA, 0xAC, 0xBB};
-uint8_t header_match_count = 0;
+// 新的协议状态
+typedef enum
+{
+    STATE_WAIT_HEADER1,
+    STATE_WAIT_HEADER2,
+    STATE_WAIT_LEN,
+    STATE_WAIT_DATA,
+    STATE_WAIT_CHECKSUM
+} ProtocolState;
+
+static ProtocolState g_rx_state = STATE_WAIT_HEADER1;
+static uint8_t g_data_len = 0;
+static uint8_t g_checksum = 0;
 
 // JY61P 解析相关
 static uint8_t RxBuffer_JY61[11];
@@ -107,13 +116,13 @@ void servo_set_lower_angle(double angle)
     double abs_delta = fabs(delta);     // 取绝对值
     if (abs_delta < 0.1125)
         return; // 如果角度变化小于0.1125度，直接返回
-    if (abs_delta > 10.0)
+    if (abs_delta > 5.0)
     {
-        pulse_delay_us = 600;
+        pulse_delay_us = 300;
     }
     else
     {
-        pulse_delay_us = 1000; // 正常转动速度
+        pulse_delay_us = 500; // 正常转动速度
     }
     if (delta < 0)
     {
@@ -140,70 +149,62 @@ void process_uart_packet(void)
         // 停止串口接收，避免干扰
         HAL_UART_AbortReceive_IT(&huart1);
 
-        parse_protocol_packet(rx_buffer, 28);
+        parse_protocol_packet(rx_buffer, g_data_len); // 使用接收到的长度
 
         // 重置并重新开始
         rx_index = 0;
         packet_ready = 0;
-        header_match_count = 0;
+        g_rx_state = STATE_WAIT_HEADER1; // 重置状态机
 
         // 重新启动接收
         HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
 }
 
-// 简洁的协议解析函数
+// 简洁的协议解析函数 - 带校验和版本
 void parse_protocol_packet(uint8_t *data, uint16_t len)
 {
-    // 检查协议头 AA CA AC BB
-    if (data[0] == 0xAA && data[1] == 0xCA &&
-        data[2] == 0xAC && data[3] == 0xBB &&
-        data[9] == 0x11) // 检查命令字节
+    // 提取舵机增量 (double, 小端序)
+    // Python: struct.pack("<dd", float(output_x), float(output_y))
+    // C: 第一个double是delta_x, 第二个是delta_y
+    double delta_x = 0, delta_y = 0;
+    memcpy(&delta_x, &data[0], sizeof(double));
+    memcpy(&delta_y, &data[8], sizeof(double));
+
+    // 判断是否瞄准完成（收到500,500）
+    if (delta_x == 500.0 && delta_y == 500.0)
     {
-        // 提取舵机增量 (double, 小端序)
-        double delta_y = 0, delta_x = 0;
-        memcpy(&delta_y, &data[10], sizeof(double));
-        memcpy(&delta_x, &data[18], sizeof(double));
-
-        // 保留两位小数
-        delta_y = (int)(delta_y * 100) / 100.0;
-        delta_x = (int)(delta_x * 100) / 100.0;
-
-        // 判断是否瞄准完成（收到500,500）
-        if (delta_x == 500.0 && delta_y == 500.0)
-        {
-            HAL_GPIO_WritePin(GPIOA, Laser_Pin, GPIO_PIN_RESET); // 激光关闭
-            return;
-        }
-
-        // 回显收到的增量数据
-        // char echo[80];
-        // sprintf(echo, "ECHO: delta_x=%d, delta_y=%d, yaw=%d\r\n", (int)(delta_x * 100), (int)(delta_y * 100), (int)(g_yaw_jy61 * 100));
-        // HAL_UART_Transmit(&huart1, (uint8_t *)echo, strlen(echo), 100);
-
-        // 更新角度
-        double new_upper = upper_angle + delta_x;
-        double new_lower = lower_angle + delta_y;
-
-        // 限制范围
-        if (new_upper < 0)
-            new_upper = 0;
-        if (new_upper > 270)
-            new_upper = 270;
-
-        // 更新舵机
-        upper_angle = new_upper;
-        servo_set_upper_angle(upper_angle);
-        servo_set_lower_angle(new_lower);
-
-        // 只输出最终结果
-        // char msg[50];
-        // sprintf(msg, "OK:%.1f,%.1f\r\n", upper_angle, lower_angle);
-        // HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
-
-        // 翻转PC13
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        HAL_GPIO_WritePin(GPIOA, Laser_Pin, GPIO_PIN_RESET); // 激光关闭
+        return;
     }
+
+    // 回显收到的增量数据
+    // char echo[80];
+    // sprintf(echo, "ECHO: delta_x=%d, delta_y=%d, yaw=%d\r\n", (int)(delta_x * 100), (int)(delta_y * 100), (int)(g_yaw_jy61 * 100));
+    // HAL_UART_Transmit(&huart1, (uint8_t *)echo, strlen(echo), 100);
+
+    // 更新角度
+    double new_upper = upper_angle + delta_y;
+    double new_lower = lower_angle + delta_x;
+
+    // 限制范围
+    if (new_upper < 0)
+        new_upper = 0;
+    if (new_upper > 270)
+        new_upper = 270;
+
+    // 更新舵机
+    upper_angle = new_upper;
+    servo_set_upper_angle(upper_angle);
+    servo_set_lower_angle(new_lower);
+
+    // 只输出最终结果
+    // char msg[50];
+    // sprintf(msg, "OK:%.1f,%.1f\r\n", upper_angle, lower_angle);
+    // HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+
+    // 翻转PC13
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
 }
 
 // JY61P 数据接收处理函数（无需头文件，直接放 main.c）
@@ -249,54 +250,74 @@ void jy61p_ReceiveData(uint8_t RxData)
     }
 }
 
-// 串口中断回调函数
+// 串口中断回调函数 - 带校验和的状态机版本
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
-        // 存储接收到的字节
-        rx_buffer[rx_index++] = rx_byte;
-
-        // 检查协议头匹配
-        if (header_match_count < PROTOCOL_HEADER_SIZE)
+        switch (g_rx_state)
         {
-            if (rx_byte == protocol_header[header_match_count])
+        case STATE_WAIT_HEADER1:
+            if (rx_byte == 0xAA)
             {
-                header_match_count++;
+                g_rx_state = STATE_WAIT_HEADER2;
+            }
+            break;
+        case STATE_WAIT_HEADER2:
+            if (rx_byte == 0xBB)
+            {
+                g_rx_state = STATE_WAIT_LEN;
             }
             else
             {
-                // 协议头不匹配，检查是否是新的开始
-                if (rx_byte == protocol_header[0])
-                {
-                    rx_index = 1;
-                    rx_buffer[0] = rx_byte;
-                    header_match_count = 1;
-                }
-                else
-                {
-                    rx_index = 0;
-                    header_match_count = 0;
-                }
+                g_rx_state = STATE_WAIT_HEADER1; // 帧头错误，复位
             }
+            break;
+        case STATE_WAIT_LEN:
+            g_data_len = rx_byte;
+            if (g_data_len > 0 && g_data_len <= sizeof(rx_buffer))
+            {
+                rx_index = 0;
+                g_checksum = 0; // 重置校验和
+                g_rx_state = STATE_WAIT_DATA;
+            }
+            else
+            {
+                g_rx_state = STATE_WAIT_HEADER1; // 长度错误，复位
+            }
+            break;
+        case STATE_WAIT_DATA:
+            if (rx_index < g_data_len)
+            {
+                rx_buffer[rx_index] = rx_byte;
+                g_checksum += rx_byte; // 累加校验和
+                rx_index++;
+            }
+            if (rx_index >= g_data_len)
+            {
+                g_rx_state = STATE_WAIT_CHECKSUM;
+            }
+            break;
+        case STATE_WAIT_CHECKSUM:
+            if (rx_byte == (g_checksum & 0xFF)) // 校验和匹配
+            {
+                packet_ready = 1;
+                // 成功接收，等待主循环处理。处理完后状态机会复位。
+                return; // 暂时不启动下一次接收
+            }
+            else
+            {
+                // 校验失败，复位状态机，丢弃数据
+                g_rx_state = STATE_WAIT_HEADER1;
+            }
+            break;
         }
 
-        // 检查是否接收完整数据包
-        if (header_match_count >= PROTOCOL_HEADER_SIZE && rx_index >= 28)
+        // 只要数据包还没准备好，就继续启动下一次接收
+        if (!packet_ready)
         {
-            packet_ready = 1;
-            return; // 数据包完整，等待处理
+            HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
         }
-
-        // 防止缓冲区溢出
-        if (rx_index >= sizeof(rx_buffer))
-        {
-            rx_index = 0;
-            header_match_count = 0;
-        }
-
-        // 重新启动接收
-        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
     else if (huart->Instance == USART2)
     {
@@ -389,7 +410,7 @@ int main(void)
     while (1)
     {
         count++;
-        if (count == 100000)
+        if (count == 3000)
         {
             double now_yaw = g_yaw_jy61; // 获取当前yaw角度
             // 计算增量(最小变化,如1到360是-2,359到4是5)
