@@ -118,11 +118,11 @@ void servo_set_lower_angle(double angle)
         return; // 如果角度变化小于0.1125度，直接返回
     if (abs_delta > 5.0)
     {
-        pulse_delay_us = 300;
+        pulse_delay_us = 200;
     }
     else
     {
-        pulse_delay_us = 500; // 正常转动速度
+        pulse_delay_us = 400; // 正常转动速度
     }
     if (delta < 0)
     {
@@ -392,17 +392,13 @@ int main(void)
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     HAL_UART_Receive_IT(&huart2, &rx_byte_jy61, 1);
 
-    // 发送提示信息
-    char welcome[] = "Protocol Parser Ready\r\nWaiting for binary protocol packets...\r\n";
-    HAL_UART_Transmit(&huart1, (uint8_t *)welcome, strlen(welcome), 1000);
-
-    // 发送当前角度
-    char status[100];
-    sprintf(status, "Initial angles: Upper=%.1f, Lower=%.1f\r\n", upper_angle, lower_angle); // 修正格式化字符串
-    HAL_UART_Transmit(&huart1, (uint8_t *)status, strlen(status), 1000);
     // 步进电机初始化
     stepper1_enable(1); // 使能（保持高电平）
     // 不再关闭使能，EN1 始终为高电平
+    // 发送提示信息
+    HAL_Delay(300); // 等待系统稳定
+    char welcome[] = "Ready\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t *)welcome, strlen(welcome), 1000);
     /* USER CODE END 2 */
 
     /* Infinite loop */
