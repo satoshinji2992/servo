@@ -5,4 +5,3 @@
 .vscode/ipch
 build
 .DS_store
-.*
