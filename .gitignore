@@ -1,4 +1,4 @@
 .pio
 build
-.DS_store
-.vscode
+.DS_Store
+.vscode/
